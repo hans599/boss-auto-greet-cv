@@ -1,1 +1,10 @@
 debug_*.png
+run.log
+
+__pycache__/
+*.pyc
+*.pyo
+
+.workbuddy/
+.venv/
+venv/
