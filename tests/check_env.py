@@ -62,14 +62,21 @@ with mss.MSS() as sct:
     print(f"  截图尺寸: {shot.shape[1]}x{shot.shape[0]}")
     cv2.imwrite("debug_window.png", shot)
 
+    dpi = main.monitor_dpi(region[0] + region[2] // 2, region[1] + region[3] // 2)
+    print(f"  显示器 DPI={dpi} (缩放 {dpi / 96:.0%})")
+    scale = main.calibrate_scale(sct, win, greet)
+    print(f"  模板缩放={scale:.2f}x  "
+          f"(模板原始 {greet.shape[1]}x{greet.shape[0]} → "
+          f"实际 {int(round(greet.shape[1] * scale))}x{int(round(greet.shape[0] * scale))})")
+
     for name, tpl in (("打招呼 greet", greet), ("继续沟通 continue", cont)):
         if tpl is None:
             print(f"  ❌ {name}: 模板图缺失")
             continue
-        res = cv2.matchTemplate(shot, tpl, cv2.TM_CCOEFF_NORMED)
-        _, best, _, loc = cv2.minMaxLoc(res)
+        scaled = main._scale_template(tpl, scale)
+        best = main._best_score(shot, scaled)
         hit = main.find_all_templates_in_region(sct, tpl, region, config.CONFIDENCE)
-        print(f"  {name}: 最高分={best:.4f} 位置={loc} 阈值={config.CONFIDENCE} "
+        print(f"  {name}: 最高分={best:.4f} 阈值={config.CONFIDENCE} "
               f"命中={hit[:2] if hit else '无'}")
 
     print("\n" + "=" * 60)

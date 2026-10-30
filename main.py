@@ -13,6 +13,13 @@
     2. 启动即检测权限隔离，明确提示并可自动以管理员身份重启；
     3. 截图区域按显示器边界裁剪，修掉最大化窗口 -9/-7 隐形边框带来的坐标偏移；
     4. 点击失败区分"环境不可用"（立刻中止并说明）与"点空了"（重试/换人）。
+
+DPI / 显示缩放（2026-10-30 补充）：
+    · 进程声明为 Per-Monitor DPI Aware，所以"窗口矩形"和"截图"都是物理像素，坐标体系一致；
+    · 但模板图是**物理像素**的：125% 下截的按钮就是 75x37，系统缩放一改按钮物理尺寸就变。
+      实测缩放偏 10%，匹配分从 0.9997 掉到 0.62，直接判定"找不到按钮"；
+    · 因此新增 calibrate_scale()：启动时扫一遍缩放比（用显示器 DPI 作搜索起点），
+      之后复用；某一轮突然找不到按钮时会自动重算（兼容中途改缩放/换不同缩放的显示器）。
 """
 import sys
 import ctypes
@@ -391,6 +398,21 @@ def dpi_awareness():
         return -1
 
 
+def monitor_dpi(x, y):
+    """(x, y) 所在显示器的实际 DPI。96 = 100%，120 = 125%，144 = 150%"""
+    try:
+        hmon = user32.MonitorFromPoint(wintypes.POINT(int(x), int(y)), 2)  # NEAREST
+        dx, dy = wintypes.UINT(), wintypes.UINT()
+        if ctypes.windll.shcore.GetDpiForMonitor(hmon, 0, ctypes.byref(dx), ctypes.byref(dy)) == 0:
+            return int(dx.value)
+    except Exception:
+        pass
+    try:
+        return int(user32.GetDpiForSystem())
+    except Exception:
+        return 96
+
+
 def process_integrity(pid):
     """返回进程完整性 RID（0x1000=Low 0x2000=Medium 0x3000=High），失败返回 None"""
     if not pid:
@@ -486,18 +508,46 @@ def wait_for_window(title, timeout=60):
     return None
 
 
+SW_RESTORE = 9
+SW_SHOW = 5
+WM_SYSCOMMAND = 0x0112
+SC_RESTORE = 0xF120
+
+
+def native_restore(win):
+    """用 Win32 还原/置前。
+
+    实测：Edge 最小化后 ShowWindow(SW_RESTORE) / ShowWindowAsync / SetWindowPos 全部无效
+    （rect 一直是 -32000,-32000），只有 SendMessage(WM_SYSCOMMAND, SC_RESTORE) 能还原。
+    pygetwindow 的 restore()/activate() 在 Edge 上也常静默失败。
+    """
+    try:
+        hwnd = win._hWnd
+        if user32.IsIconic(hwnd):
+            user32.SendMessageW(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0)
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, SW_RESTORE)
+        else:
+            user32.ShowWindow(hwnd, SW_SHOW)
+        user32.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
+
+
 def ensure_window_active(win, sct=None, tries=3):
     """把浏览器切到前台。成功返回 True。"""
     for i in range(tries):
         try:
-            if win.isMinimized:
-                win.restore()
-                stop.sleep(0.4)
             if win.isActive:
                 return True
-            win.activate()
-        except Exception as e:
-            # pygetwindow 在 Windows 上即使成功也常抛异常，用真实前台窗口兜底判断
+        except Exception:
+            pass
+        native_restore(win)          # 先走 Win32（更可靠）
+        try:
+            if not win.isMinimized:
+                win.activate()
+        except Exception:
             pass
         stop.sleep(0.6)
         try:
@@ -505,6 +555,7 @@ def ensure_window_active(win, sct=None, tries=3):
                 return True
         except Exception:
             pass
+
     ok = foreground_is(win)
     print("  " + ("窗口已在前台" if ok else "⚠️ 无法把浏览器切到前台，请手动点一下浏览器窗口"))
     return ok
@@ -561,18 +612,99 @@ def grab_region(sct, region):
     return cv2.cvtColor(np.array(raw), cv2.COLOR_BGRA2BGR)
 
 
-def find_all_templates_in_region(sct, template, region, confidence):
-    """返回最上面一个匹配 (中心x, 中心y, 分数, w, h)"""
+# --------------------------------------------------------------------------------------
+# 模板缩放自适应（应对系统缩放/DPI 与截图时不一致）
+#   模板是"物理像素"图片，125% 下截的按钮就是 75x37。
+#   实测：缩放偏 10% 匹配分就从 0.99 掉到 0.62，直接判定"找不到按钮"。
+#   所以启动时先扫一遍缩放，求出当前真实的缩放比，之后复用；中途改缩放会自动重算。
+# --------------------------------------------------------------------------------------
+_SCALE = {"value": 1.0, "valid": False, "score": 0.0}
+
+
+def reset_template_scale():
+    _SCALE["valid"] = False
+
+
+def _scale_template(tpl, s):
+    if abs(s - 1.0) < 1e-3:
+        return tpl
+    interp = cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC
+    return cv2.resize(tpl, None, fx=s, fy=s, interpolation=interp)
+
+
+def _best_score(screen, tpl):
+    th, tw = tpl.shape[:2]
+    if screen is None or screen.size == 0:
+        return -1.0
+    if screen.shape[0] < th or screen.shape[1] < tw:
+        return -1.0
+    return float(cv2.matchTemplate(screen, tpl, cv2.TM_CCOEFF_NORMED).max())
+
+
+def calibrate_scale(sct, win, template, verbose=True):
+    """在当前画面上求出模板的真实缩放比，写入 _SCALE 缓存。"""
+    region = window_region(sct, win)
+    screen = grab_region(sct, region)
+    if screen is None or template is None:
+        return _SCALE["value"]
+    if config.TEMPLATE_SCALE is not None:          # 用户手工指定，跳过搜索
+        _SCALE.update(value=float(config.TEMPLATE_SCALE), valid=True, score=1.0)
+        if verbose:
+            log(f"🎚️ 模板缩放：手动指定 {_SCALE['value']:.2f}x")
+        return _SCALE["value"]
+
+    lo, hi, step = config.SCALE_SEARCH
+    # 用 DPI 给一个搜索起点：模板大概是按 SCALE_REFERENCE_DPI 截的
+    dpi = monitor_dpi(region[0] + region[2] // 2, region[1] + region[3] // 2)
+    hint = dpi / max(config.SCALE_REFERENCE_DPI, 1)
+
+    # 先把提示点附近搜一遍，命中就不必全范围扫
+    near = sorted({round(max(lo, min(hi, hint + d)), 3)
+                   for d in (0, -0.05, 0.05, -0.1, 0.1, -0.15, 0.15, -0.2, 0.2)})
+    best_s, best_score = None, -1.0
+    for s in near:
+        sc = _best_score(screen, _scale_template(template, s))
+        if sc > best_score:
+            best_s, best_score = s, sc
+        if sc >= 0.93:
+            break
+    # 没命中再全范围粗扫
+    if best_score < 0.9:
+        s = lo
+        while s <= hi + 1e-6:
+            sc = _best_score(screen, _scale_template(template, s))
+            if sc > best_score:
+                best_s, best_score = s, sc
+            s = round(s + step, 4)
+
+    if best_score >= 0.7:
+        _SCALE.update(value=float(best_s), valid=True, score=best_score)
+        if verbose:
+            log(f"🎚️ 模板缩放自动校准：{best_s:.2f}x（匹配度 {best_score:.3f}，"
+                f"显示器 DPI={dpi} 即 {dpi / 96:.0%}）")
+    else:
+        _SCALE.update(value=1.0, valid=False, score=best_score)
+        if verbose:
+            log(f"🎚️ 模板缩放校准未命中（最高 {best_score:.3f}，DPI={dpi}），"
+                f"暂用 1.00x；找不到按钮时会再校准一次")
+    return _SCALE["value"]
+
+
+def find_all_templates_in_region(sct, template, region, confidence, scale=None):
+    """返回最上面一个匹配 (中心x, 中心y, 分数, w, h)，w/h 是缩放后的真实尺寸"""
     if template is None or region is None:
         return None
     screen = grab_region(sct, region)
     if screen is None or screen.size == 0:
         return None
-    th, tw = template.shape[:2]
+
+    s = scale if scale is not None else _SCALE["value"]
+    tpl = _scale_template(template, s)
+    th, tw = tpl.shape[:2]
     if screen.shape[0] < th or screen.shape[1] < tw:
         return None
 
-    result = cv2.matchTemplate(screen, template, cv2.TM_CCOEFF_NORMED)
+    result = cv2.matchTemplate(screen, tpl, cv2.TM_CCOEFF_NORMED)
     ys, xs = np.where(result >= confidence)
     if len(xs) == 0:
         return None
@@ -601,7 +733,8 @@ def verify_click(sct, continue_tpl, target_x, target_y, tw, th):
                               tw + margin * 2,
                               th + margin * 2))
     stop.sleep(config.VERIFY_DELAY)
-    return find_all_templates_in_region(sct, continue_tpl, region, config.CONFIDENCE) is not None
+    return find_all_templates_in_region(
+        sct, continue_tpl, region, config.VERIFY_CONFIDENCE) is not None
 
 
 def load_template(path):
@@ -695,9 +828,11 @@ def run_automation(sct, win, greet_tpl, continue_tpl, dry_run=False, max_greets=
     empty_scrolls = 0     # 连续"没找到按钮"的次数
     stuck = 0             # 连续"滚动后页面毫无变化"的次数
     last_point = None     # 上次成功点击的位置，用来识别"界面没刷新"
+    recalibrated = False  # 本轮是否已因"找不到按钮"重算过缩放
     exit_reason = "达到上限"
 
     log(f"===== 开始执行（目标 {limit} 个）=====")
+    calibrate_scale(sct, win, greet_tpl)   # 先按当前 DPI 校准模板缩放
 
     while greeted < limit:
         stop.check()  # 每轮开始前响应急停
@@ -705,9 +840,34 @@ def run_automation(sct, win, greet_tpl, continue_tpl, dry_run=False, max_greets=
             ensure_window_active(win, sct)
 
         region = window_region(sct, win)
+        if region is None:
+            stuck += 1
+            log(f"⚠️ 窗口不在可见区域（被最小化或移出屏幕），尝试还原"
+                f"（{stuck}/{config.MAX_SCROLL_STUCK}）")
+            native_restore(win)
+            stop.sleep(0.8)
+            if stuck >= config.MAX_SCROLL_STUCK:
+                exit_reason = "浏览器窗口不可见（最小化或被移到屏幕外）"
+                break
+            continue
+
         found = find_all_templates_in_region(sct, greet_tpl, region, config.CONFIDENCE)
 
         # ---------- 本屏没找到「打招呼」 ----------
+        if found is not None:
+            recalibrated = False
+
+        if found is None and not recalibrated:
+            # 可能中途改了显示缩放/把窗口拖到了另一块不同缩放的显示器 → 重算缩放再找一次
+            recalibrated = True
+            log("🎚️ 没找到「打招呼」，先按当前画面重算一次模板缩放"
+                "（支持中途改显示缩放/换显示器）...")
+            calibrate_scale(sct, win, greet_tpl)
+            region = window_region(sct, win)
+            found = find_all_templates_in_region(sct, greet_tpl, region, config.CONFIDENCE)
+            if found is not None:
+                log(f"   重算后命中，当前缩放 {_SCALE['value']:.2f}x")
+
         if found is None:
             empty_scrolls += 1
             path = save_debug(sct, region, "nogreet")
