@@ -510,45 +510,79 @@ def wait_for_window(title, timeout=60):
 
 SW_RESTORE = 9
 SW_SHOW = 5
+SW_MAXIMIZE = 3
 WM_SYSCOMMAND = 0x0112
 SC_RESTORE = 0xF120
 
+# 记录窗口启动时的显示状态，用来保证"原来最大化就一直最大化"
+WIN_STATE = {"hwnd": None, "maximized": None}
+
+
+def remember_window_state(win):
+    try:
+        hwnd = win._hWnd
+        WIN_STATE["hwnd"] = hwnd
+        WIN_STATE["maximized"] = bool(user32.IsZoomed(hwnd))
+    except Exception:
+        pass
+    return WIN_STATE["maximized"]
+
 
 def native_restore(win):
-    """用 Win32 还原/置前。
+    """把窗口唤到前台，但**绝不改变它的尺寸/最大化状态**。
 
-    实测：Edge 最小化后 ShowWindow(SW_RESTORE) / ShowWindowAsync / SetWindowPos 全部无效
-    （rect 一直是 -32000,-32000），只有 SendMessage(WM_SYSCOMMAND, SC_RESTORE) 能还原。
-    pygetwindow 的 restore()/activate() 在 Edge 上也常静默失败。
+    实测：
+      · Edge 最小化后 ShowWindow(SW_RESTORE) / ShowWindowAsync / SetWindowPos 全部无效
+        （rect 一直停在 -32000,-32000），只有 SendMessage(WM_SYSCOMMAND, SC_RESTORE) 能还原；
+      · 但对"已经最大化"的窗口调用 SW_RESTORE / SW_SHOW 有把它变回普通窗口的风险，
+        所以这里只对最小化的窗口做还原，其余情况一律不动尺寸，只 SetForegroundWindow。
     """
     try:
         hwnd = win._hWnd
         if user32.IsIconic(hwnd):
             user32.SendMessageW(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0)
-            if user32.IsIconic(hwnd):
-                user32.ShowWindow(hwnd, SW_RESTORE)
-        else:
-            user32.ShowWindow(hwnd, SW_SHOW)
+            # 最小化前是最大化 → 还原后必须还是最大化
+            if WIN_STATE.get("maximized") and not user32.IsZoomed(hwnd):
+                user32.ShowWindow(hwnd, SW_MAXIMIZE)
         user32.SetForegroundWindow(hwnd)
         return True
     except Exception:
         return False
 
 
+def ensure_window_state(win, verbose=True):
+    """保证窗口保持启动时的显示状态（默认"原来最大化就一直最大化"）。
+    程序只负责把窗口唤到前台，绝不缩小它。"""
+    try:
+        hwnd = win._hWnd
+        if WIN_STATE.get("hwnd") != hwnd:
+            remember_window_state(win)
+            return
+        if not getattr(config, "KEEP_MAXIMIZED", True) or not WIN_STATE.get("maximized"):
+            return
+        if user32.IsIconic(hwnd):
+            return  # 最小化由 native_restore 处理
+        if not user32.IsZoomed(hwnd):
+            user32.ShowWindow(hwnd, SW_MAXIMIZE)
+            if verbose:
+                log("🔲 窗口不再是最大化，已恢复最大化（程序不会把窗口改小）")
+    except Exception:
+        pass
+
+
 def ensure_window_active(win, sct=None, tries=3):
-    """把浏览器切到前台。成功返回 True。"""
+    """把浏览器切到前台。成功返回 True。不会改变窗口大小。"""
+    if WIN_STATE.get("hwnd") != win._hWnd:
+        remember_window_state(win)
+
     for i in range(tries):
         try:
             if win.isActive:
+                ensure_window_state(win, verbose=False)
                 return True
         except Exception:
             pass
-        native_restore(win)          # 先走 Win32（更可靠）
-        try:
-            if not win.isMinimized:
-                win.activate()
-        except Exception:
-            pass
+        native_restore(win)
         stop.sleep(0.6)
         try:
             if win.isActive:
@@ -838,6 +872,8 @@ def run_automation(sct, win, greet_tpl, continue_tpl, dry_run=False, max_greets=
         stop.check()  # 每轮开始前响应急停
         if not foreground_is(win):
             ensure_window_active(win, sct)
+        else:
+            ensure_window_state(win)   # 每轮确认窗口还是最大化，程序不会把它改小
 
         region = window_region(sct, win)
         if region is None:
@@ -1042,6 +1078,9 @@ def _run(opts):
     if win is None:
         print(f"等待窗口「{config.WINDOW_TITLE}」超时，退出。")
         return 1
+
+    maximized = remember_window_state(win)
+    print(f"   窗口状态：{'最大化' if maximized else '普通大小'}（程序只置前，不会改变窗口大小）")
 
     reason = input_blocked_reason(win)
     if reason:

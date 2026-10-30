@@ -15,6 +15,10 @@ VERIFY_DELAY = 2.0
 WINDOW_TITLE = "Microsoft Edge"
 WINDOW_WAIT_SECONDS = 60
 
+# 保持窗口最大化。程序只会把浏览器"唤到前台"，绝不改变窗口大小；
+# 若发现窗口意外不再是最大化（比如被系统/别的软件还原了），会自动恢复最大化。
+KEEP_MAXIMIZED = True
+
 # ===== 模板匹配 =====
 CONFIDENCE = 0.8
 
